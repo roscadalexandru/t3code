@@ -7,10 +7,14 @@ import {
   NodeId,
   ORCHESTRATOR_MCP_RUNNING_TASK_NEXT,
   type OrchestratorMcpCapabilitiesResult,
+  type OrchestratorMcpFailure,
+  type OrchestratorMcpScheduleTaskResult,
   OrchestratorMcpTarget,
   type OrchestrationV2ThreadShell,
+  type Project as ProjectRecord,
   type ScheduledTask,
   ScheduledTaskId,
+  type ScheduledTaskUpsertInput,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -2207,7 +2211,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         ),
       );
 
-    it.effect("hides a webhook URL from a caller below the task's modes", () =>
+    it.effect("gives a webhook's addresses only to a caller within the task's modes", () =>
       Effect.gen(function* () {
         const upserted = yield* Ref.make(0);
         const listed = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
@@ -2217,6 +2221,10 @@ describe("OrchestratorMcpService provider resolution", () => {
               [
                 task({ runtimeMode: "full-access" }),
                 task({ id: ScheduledTaskId.make("scheduled-task:supervised") }),
+                task({
+                  id: ScheduledTaskId.make("scheduled-task:local"),
+                  webhook: { path: "/hooks/scheduled-task/local", url: null, hasSecret: false },
+                }),
               ],
               null,
               upserted,
@@ -2224,8 +2232,12 @@ describe("OrchestratorMcpService provider resolution", () => {
           ),
         );
         assert.deepEqual(
-          listed.tasks.map((summary) => summary.webhookUrl),
-          [undefined, "https://t3.example/hooks/secret"],
+          listed.tasks.map((summary) => [summary.webhookUrl, summary.webhookPath]),
+          [
+            [undefined, undefined],
+            ["https://t3.example/hooks/secret", "/hooks/scheduled-task/secret"],
+            [undefined, "/hooks/scheduled-task/local"],
+          ],
         );
       }),
     );
@@ -2277,6 +2289,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           ),
         );
         assert.equal(listed.tasks[0]?.webhookUrl, undefined);
+        assert.equal(listed.tasks[0]?.webhookPath, undefined);
       }),
     );
 
@@ -2296,6 +2309,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           Effect.provide(service([task({})], null, upserted)),
         );
         assert.equal(listed.tasks[0]?.webhookUrl, undefined);
+        assert.equal(listed.tasks[0]?.webhookPath, undefined);
       }),
     );
 
@@ -2313,6 +2327,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         );
         const listed = yield* mcp.listScheduledTasks(supervisedClient, { projectId });
         assert.equal(listed.tasks[0]?.webhookUrl, undefined);
+        assert.equal(listed.tasks[0]?.webhookPath, undefined);
         const error = yield* mcp
           .updateScheduledTask(supervisedClient, {
             scheduledTaskId: bound.id,
@@ -2373,6 +2388,235 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.equal(yield* Ref.get(upserted), 1);
         assert.equal(updated.scheduledTaskId, bound.id);
         assert.equal(updated.webhookUrl, undefined);
+      }),
+    );
+  });
+
+  describe("scheduled task workspaces", () => {
+    const projectId = ProjectId.make("project:mcp-test");
+    const workspaceRoot = "/projects/factory";
+    const devWorktree = "/projects/factory-dev";
+    const defaultWorkspace = { type: "worktree", baseRef: "main", startFromOrigin: true } as const;
+    const devBase = { type: "worktree", baseRef: "DEV", startFromOrigin: false } as const;
+    const schedule = { type: "interval", everyMs: 3_600_000 } as const;
+    const unbound: ScheduledTask = {
+      id: ScheduledTaskId.make("scheduled-task:unbound"),
+      title: "Next card",
+      prompt: "Run the next card",
+      enabled: true,
+      schedule,
+      projectId,
+      threadId: null,
+      workspaceStrategy: devBase,
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      createdBy: "agent",
+      creationSource: "mcp",
+      createdAt: "2026-10-26T00:00:00.000Z",
+      updatedAt: "2026-10-26T00:00:00.000Z",
+      nextRunAt: null,
+      lastRunAt: null,
+      lastRunStatus: "never",
+      lastRunError: null,
+      runCount: 0,
+    };
+    const bound: ScheduledTask = {
+      ...unbound,
+      id: ScheduledTaskId.make("scheduled-task:bound"),
+      threadId: ThreadId.make("thread:workspace-bound"),
+      workspaceStrategy: { type: "root" },
+    };
+    const client: McpInvocationScope = {
+      environmentId: EnvironmentId.make("environment:workspace"),
+      requestNamespace: "client:workspace",
+      thread: undefined,
+      client: { sessionId: "workspace", label: "Claude Code", access: "approval-required" },
+      capabilities: new Set(["orchestration"]),
+      issuedAt: 1,
+    };
+    const threadCaller: McpInvocationScope = {
+      ...client,
+      requestNamespace: "provider:workspace",
+      thread: {
+        threadId: ThreadId.make("thread:workspace-caller"),
+        providerSessionId: "provider:workspace",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      },
+      client: undefined,
+    };
+    const shell = (threadId: ThreadId) =>
+      liveThreadShell(threadId, { runtimeMode: "approval-required" });
+    const service = (saved: Ref.Ref<ReadonlyArray<ScheduledTaskUpsertInput>>) =>
+      OrchestratorMcpService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+              checkWorktreeBase: ({ workspaceStrategy }) =>
+                workspaceStrategy.type === "worktree" && workspaceStrategy.baseRef === "missing"
+                  ? Effect.fail(
+                      new ThreadLaunchService.ThreadLaunchBaseRefError({
+                        projectId,
+                        projectTitle: "Factory",
+                        workspaceRoot,
+                        baseRef: workspaceStrategy.baseRef,
+                      }),
+                    )
+                  : Effect.void,
+            }),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({
+              listWorktreePaths: () => Effect.succeed([workspaceRoot, devWorktree]),
+            }),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: (threadId) => Effect.succeed(shell(threadId)),
+              getThreadRecords: (threadId) => Effect.succeed(idleThreadProjection(shell(threadId))),
+            }),
+            ServerSettings.layerTest(),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+              list: () => Effect.succeed([]),
+            }),
+            Layer.mock(ProjectService.ProjectService)({
+              getById: (id) =>
+                Effect.succeedSome({
+                  id,
+                  workspaceRoot,
+                  defaultModelSelection: unbound.modelSelection,
+                } as unknown as ProjectRecord),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+              list: () => Effect.succeed({ tasks: [unbound, bound] }),
+              upsert: (input) =>
+                Ref.update(saved, (inputs) => [...inputs, input]).pipe(
+                  Effect.as({
+                    task: {
+                      ...unbound,
+                      threadId: input.threadId ?? null,
+                      workspaceStrategy: input.workspaceStrategy,
+                    },
+                  }),
+                ),
+            }),
+          ),
+        ),
+      );
+
+    it.effect("starts an unbound task's runs in the workspace it was given, else from main", () =>
+      Effect.gen(function* () {
+        const saved = yield* Ref.make<ReadonlyArray<ScheduledTaskUpsertInput>>([]);
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(service(saved)),
+        );
+        const devCheckout = { type: "existing_worktree", worktreePath: devWorktree } as const;
+        yield* mcp.scheduleTask(client, { projectId, prompt: "Run the next card", schedule });
+        const created = yield* mcp.scheduleTask(client, {
+          projectId,
+          prompt: "Run the next card",
+          schedule,
+          workspaceStrategy: devBase,
+        });
+        yield* mcp.scheduleTask(client, {
+          projectId,
+          prompt: "Run the next card",
+          schedule,
+          workspaceStrategy: devCheckout,
+        });
+        assert.deepEqual(
+          (yield* Ref.get(saved)).map((input) => input.workspaceStrategy),
+          [defaultWorkspace, devBase, devCheckout],
+        );
+        assert.deepEqual(created.workspaceStrategy, devBase);
+      }),
+    );
+
+    it.effect("keeps, replaces or resets an unbound task's workspace on update", () =>
+      Effect.gen(function* () {
+        const saved = yield* Ref.make<ReadonlyArray<ScheduledTaskUpsertInput>>([]);
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(service(saved)),
+        );
+        const release = { type: "worktree", baseRef: "release" } as const;
+        yield* mcp.updateScheduledTask(client, {
+          scheduledTaskId: unbound.id,
+          prompt: "Run two cards",
+          bindToCurrentThread: false,
+        });
+        yield* mcp.updateScheduledTask(client, {
+          scheduledTaskId: unbound.id,
+          workspaceStrategy: release,
+        });
+        yield* mcp.updateScheduledTask(client, {
+          scheduledTaskId: unbound.id,
+          workspaceStrategy: null,
+        });
+        yield* mcp.updateScheduledTask(client, {
+          scheduledTaskId: bound.id,
+          bindToCurrentThread: false,
+        });
+        yield* mcp.updateScheduledTask(client, {
+          scheduledTaskId: bound.id,
+          bindToCurrentThread: false,
+          workspaceStrategy: devBase,
+        });
+        assert.deepEqual(
+          (yield* Ref.get(saved)).map((input) => input.workspaceStrategy),
+          [devBase, release, defaultWorkspace, defaultWorkspace, devBase],
+        );
+      }),
+    );
+
+    it.effect("refuses a workspace that the runs would not use or may not reach", () =>
+      Effect.gen(function* () {
+        const saved = yield* Ref.make<ReadonlyArray<ScheduledTaskUpsertInput>>([]);
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(service(saved)),
+        );
+        const refusals: ReadonlyArray<
+          readonly [
+            Effect.Effect<OrchestratorMcpScheduleTaskResult, OrchestratorMcpFailure>,
+            RegExp,
+          ]
+        > = [
+          [
+            mcp.scheduleTask(threadCaller, {
+              prompt: "Run the next card",
+              schedule,
+              workspaceStrategy: devBase,
+            }),
+            /bindToCurrentThread: false/,
+          ],
+          [
+            mcp.updateScheduledTask(client, {
+              scheduledTaskId: bound.id,
+              workspaceStrategy: devBase,
+            }),
+            /bindToCurrentThread: false/,
+          ],
+          [
+            mcp.scheduleTask(client, {
+              projectId,
+              prompt: "Run the next card",
+              schedule,
+              workspaceStrategy: { type: "existing_worktree", worktreePath: "/projects/other" },
+            }),
+            /one of the project's git worktrees/,
+          ],
+          [
+            mcp.updateScheduledTask(client, {
+              scheduledTaskId: unbound.id,
+              workspaceStrategy: { type: "worktree", baseRef: "missing" },
+            }),
+            /Base ref "missing"/,
+          ],
+        ];
+        for (const [call, reason] of refusals) {
+          const error = yield* Effect.flip(call);
+          assert.equal(error.code, "invalid_request");
+          assert.match(error.message, reason);
+        }
+        assert.deepEqual(yield* Ref.get(saved), []);
       }),
     );
   });

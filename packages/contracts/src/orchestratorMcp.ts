@@ -35,6 +35,7 @@ import {
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
+  OrchestrationV2ThreadLaunchWorkspaceStrategy,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
 import { ProviderOptionSelection, ProviderOptionSelectionValue } from "./model.ts";
@@ -578,6 +579,12 @@ export const OrchestratorMcpScheduleTaskInput = Schema.Struct({
       description: "Default true: runs post in this thread. False: new thread per run.",
     }),
   ),
+  workspaceStrategy: Schema.optional(
+    OrchestrationV2ThreadLaunchWorkspaceStrategy.annotate({
+      description:
+        "Where each run's new thread works, as in t3_thread_launch. Needs bindToCurrentThread: false. Default: new worktree from `main`, fetched from origin.",
+    }),
+  ),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
 });
 export type OrchestratorMcpScheduleTaskInput = typeof OrchestratorMcpScheduleTaskInput.Type;
@@ -592,9 +599,16 @@ export const OrchestratorMcpScheduledTask = Schema.Struct({
   schedule: ScheduledTaskSchedule,
   nextRunAt: Schema.NullOr(IsoDateTime),
   lastRunStatus: ScheduledTaskRunStatus,
+  workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy).annotate({
+    description: "Where each run's new thread works. Absent when runs post in `boundThreadId`.",
+  }),
   webhookUrl: Schema.optional(Schema.String).annotate({
     description:
       "Public URL for the sender. Absent: no T3 Connect tunnel. The user must enable T3 Connect remote access.",
+  }),
+  webhookPath: Schema.optional(Schema.String).annotate({
+    description:
+      "Path on this server, token included. A sender that reaches the server directly (same machine, LAN, Tailscale) calls the server's address plus this path.",
   }),
   webhookSignature: Schema.optional(Schema.Literals(["none", "set"])),
 });
@@ -626,6 +640,12 @@ export const OrchestratorMcpUpdateScheduledTaskInput = Schema.Struct({
   schedule: Schema.optional(OrchestratorMcpSchedule),
   enabled: Schema.optional(Schema.Boolean),
   bindToCurrentThread: Schema.optional(Schema.Boolean),
+  workspaceStrategy: Schema.optional(
+    Schema.NullOr(OrchestrationV2ThreadLaunchWorkspaceStrategy).annotate({
+      description:
+        "As in schedule_task. Needs an unbound task or bindToCurrentThread: false. Null: back to the default.",
+    }),
+  ),
 });
 export type OrchestratorMcpUpdateScheduledTaskInput =
   typeof OrchestratorMcpUpdateScheduledTaskInput.Type;

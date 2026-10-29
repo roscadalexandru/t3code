@@ -80,6 +80,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -289,6 +290,28 @@ function scheduledTaskWorkspaceStrategy(
     : { type: "worktree", baseRef: "main", startFromOrigin: true };
 }
 
+const UNBOUND_WORKSPACE_ONLY =
+  "workspaceStrategy applies only when each run starts a new thread. Pass bindToCurrentThread: false.";
+
+/** Require project worktrees so launches cannot target arbitrary host directories. */
+export const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
+  workspaceRoot: string,
+  worktreePath: string,
+) {
+  const git = yield* GitVcsDriver.GitVcsDriver;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const real = (path: string) => fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
+  const worktrees = yield* git.listWorktreePaths(workspaceRoot).pipe(
+    Effect.flatMap((paths) => Effect.forEach(paths, real)),
+    Effect.orElseSucceed((): ReadonlyArray<string> => []),
+  );
+  if (!worktrees.includes(yield* real(worktreePath)))
+    return yield* failure(
+      "invalid_request",
+      "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
+    );
+});
+
 function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): OrchestratorMcpScheduledTask {
   return {
     scheduledTaskId: task.id,
@@ -300,6 +323,8 @@ function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): Orchestrato
     schedule: task.schedule,
     nextRunAt: task.nextRunAt,
     lastRunStatus: task.lastRunStatus,
+    ...(task.threadId === null ? { workspaceStrategy: task.workspaceStrategy } : {}),
+    ...(task.webhook === undefined || !mayRun ? {} : { webhookPath: task.webhook.path }),
     ...(task.webhook?.url == null || !mayRun ? {} : { webhookUrl: task.webhook.url }),
     ...(task.webhook === undefined
       ? {}
@@ -1061,6 +1086,7 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+  const fileSystem = yield* FileSystem.FileSystem;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
 
   const requireProject = (projectId: ProjectId) =>
@@ -1731,7 +1757,7 @@ const make = Effect.gen(function* () {
     interactionModeRank(modes.interactionMode) <= interactionModeRank(limits.interactionMode);
 
   /**
-   * Its webhook URL starts runs, so only a caller that may start one sees it: never a client
+   * Its webhook URL and path start runs, so only a caller that may start one sees them: never a client
    * approved for read-only access, and a thread caller only with a live turn, at modes covering
    * every mode the task runs at.
    */
@@ -1791,6 +1817,35 @@ const make = Effect.gen(function* () {
     return task;
   });
 
+  /** A workspace an agent picks for a task's runs passes the checks t3_thread_launch makes. */
+  const checkScheduledTaskWorkspace = Effect.fn(
+    "OrchestratorMcpService.checkScheduledTaskWorkspace",
+  )(function* (projectId: ProjectId, workspaceStrategy: ScheduledTask["workspaceStrategy"]) {
+    if (workspaceStrategy.type === "existing_worktree") {
+      const project = yield* requireProject(projectId);
+      yield* assertProjectWorktree(project.workspaceRoot, workspaceStrategy.worktreePath).pipe(
+        Effect.provideService(GitVcsDriver.GitVcsDriver, gitDriver),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+      );
+    }
+    if (workspaceStrategy.type === "worktree") {
+      yield* threadLaunch
+        .checkWorktreeBase({ projectId, workspaceStrategy })
+        .pipe(
+          Effect.mapError((error) =>
+            failure(
+              "invalid_request",
+              `${error.message} The task was not saved. ${
+                workspaceStrategy.startFromOrigin === true
+                  ? "The project has no usable remote to fetch it from."
+                  : "Pass a ref that exists there, or startFromOrigin: true if it exists only on a remote."
+              }`,
+            ),
+          ),
+        );
+    }
+  });
+
   return OrchestratorMcpService.of({
     scheduleTask: Effect.fn("OrchestratorMcpService.scheduleTask")(function* (scope, input) {
       const { parent, limits } = yield* loadCaller(scope);
@@ -1808,6 +1863,10 @@ const make = Effect.gen(function* () {
             : "bindToCurrentThread binds to this thread, which belongs to a different project.",
         );
       }
+      if (input.workspaceStrategy !== undefined) {
+        if (bindToCurrentThread) return yield* failure("invalid_request", UNBOUND_WORKSPACE_ONLY);
+        yield* checkScheduledTaskWorkspace(projectId, input.workspaceStrategy);
+      }
       const modelSelection =
         parent?.thread.modelSelection ?? (yield* projectDefaultModelSelection(project));
       const derivedTitle = input.prompt.split("\n")[0]?.trim() ?? "";
@@ -1820,7 +1879,8 @@ const make = Effect.gen(function* () {
         schedule: input.schedule,
         projectId,
         threadId: bindToCurrentThread && parent !== undefined ? parent.thread.id : null,
-        workspaceStrategy: scheduledTaskWorkspaceStrategy(bindToCurrentThread),
+        workspaceStrategy:
+          input.workspaceStrategy ?? scheduledTaskWorkspaceStrategy(bindToCurrentThread),
         modelSelection,
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
@@ -1882,17 +1942,27 @@ const make = Effect.gen(function* () {
               : "bindToCurrentThread binds to this thread, which belongs to a different project.",
           );
         }
+        const wasBound = existing.threadId !== null;
+        const bound = input.bindToCurrentThread ?? wasBound;
+        if (input.workspaceStrategy !== undefined && bound) {
+          return yield* failure("invalid_request", UNBOUND_WORKSPACE_ONLY);
+        }
+        if (input.workspaceStrategy != null) {
+          yield* checkScheduledTaskWorkspace(existing.projectId, input.workspaceStrategy);
+        }
         const threadId =
           input.bindToCurrentThread === undefined
             ? existing.threadId
             : input.bindToCurrentThread && parent !== undefined
               ? parent.thread.id
               : null;
-        // Update workspace strategy on rebinding so unbound root tasks cannot run in the shared checkout.
+        // A binding change resets the workspace, so an unbound task never keeps a bound task's root checkout.
         const workspaceStrategy =
-          input.bindToCurrentThread === undefined
-            ? existing.workspaceStrategy
-            : scheduledTaskWorkspaceStrategy(input.bindToCurrentThread);
+          input.workspaceStrategy === undefined
+            ? bound === wasBound
+              ? existing.workspaceStrategy
+              : scheduledTaskWorkspaceStrategy(bound)
+            : (input.workspaceStrategy ?? scheduledTaskWorkspaceStrategy(false));
         const upsertInput: ScheduledTaskUpsertInput = {
           id: existing.id,
           title: input.title ?? existing.title,
@@ -2955,6 +3025,7 @@ export const layer: Layer.Layer<
   | ThreadManagementService.ThreadManagementService
   | ThreadLaunchService.ThreadLaunchService
   | GitVcsDriver.GitVcsDriver
+  | FileSystem.FileSystem
   | ProviderRegistry.ProviderRegistry
   | ProviderAdapterRegistry.ProviderAdapterRegistryV2
   | ScheduledTaskService.ScheduledTaskService
